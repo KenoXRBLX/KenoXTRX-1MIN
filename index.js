@@ -11,8 +11,8 @@ const logging = {
   debug: (msg) => console.log(`[DEBUG] ${new Date().toISOString()} - ${msg}`)
 };
 
-const BOT_TOKEN = process.env.BOT_TOKEN; //create your bot from botfather and get token
-const ADMIN_ID = process.env.ADMIN_ID; //your chat id
+const BOT_TOKEN = "8646543959:AAG2Jbp-3izB78xfZuw9jKXeF3WSHLLDi6w";
+const ADMIN_ID = 7915159454;
 const BASE_URL = "https://ckygjf6r.com/api/webapi/";
 const TRX_HISTORY_URL = "https://draw.ar-lottery01.com/TrxWinGo/TrxWinGo_1M/GetHistoryIssuePage.json";
 const WIN_LOSE_CHECK_INTERVAL = 2;
@@ -27,10 +27,12 @@ const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_TELEGRAM_RETRIES = 3;
 const TELEGRAM_RETRY_DELAY = 2000;
 const DEFAULT_BS_ORDER = "BSBBSBSSSB";
-const VIRTUAL_BALANCE = 786700;
+const VIRTUAL_BALANCE = 1135612.26;
 const MIN_AI_PREDICTION_DATA = 5;
 const HISTORY_BUFFER_SIZE = 20;
-const KENNO_REQUIRED = 11; 
+const KENNO_REQUIRED = 11;
+const KENNO_V2_REQUIRED = 1;
+const KENNO_MAX_REQUIRED = 2;
 
 const userState = {};
 const userTemp = {};
@@ -48,6 +50,8 @@ const userAILast10Results = [];
 const userAIRoundCount = {};
 const userStopInitiated = {};
 const userSLSkipWaitingForWin = {};
+const userKennoMaxHits = {};
+const userKennoMaxConsecLosses = {};
 let allowedcklotteryIds = new Set();
 
 const KENNO_FILE = path.join(process.cwd(), 'data', 'kenno_results.json');
@@ -153,6 +157,77 @@ function getKENNOPrediction() {
   };
 }
 
+function getKENNOV2Prediction() {
+  const results = loadKENNOResults();
+
+  if (results.length < 3) {
+    logging.warning(`KENNO V2: Need 3 results, have ${results.length}`);
+    return null;
+  }
+
+  const num1 = parseInt(results[0].number || '0') % 10;
+  const num2 = parseInt(results[1].number || '0') % 10;
+  const num3 = parseInt(results[2].number || '0') % 10;
+
+  const weightedSum = (num1 * 0.5) + (num2 * 0.3) + (num3 * 0.2);
+  const bigSmall = weightedSum >= 5 ? 'B' : 'S';
+
+  logging.info(`KENNO V2: [${num1}x0.5 + ${num2}x0.3 + ${num3}x0.2 = ${weightedSum.toFixed(2)}] => ${bigSmall === 'B' ? 'BIG' : 'SMALL'}`);
+
+  return {
+    result: bigSmall,
+    weightedSum: weightedSum,
+    num1: num1,
+    num2: num2,
+    num3: num3,
+    issueNumber: results[0].issueNumber,
+    totalResults: results.length
+  };
+}
+
+function getKENNOMaxPrediction() {
+  const results = loadKENNOResults();
+
+  if (results.length < KENNO_MAX_REQUIRED) {
+    logging.warning(`KENNO MAX: Need ${KENNO_MAX_REQUIRED} results, have ${results.length}`);
+    return null;
+  }
+
+  const latest = results[0];
+  const issueNumber = String(latest.issueNumber);
+  const lastTwoDigits = parseInt(issueNumber.slice(-2));
+  const nextTwoDigits = lastTwoDigits + 1;
+
+  if (nextTwoDigits % 3 !== 0) {
+    logging.info(`KENNO MAX: next=${nextTwoDigits} => NOT divisible by 3, skip`);
+    return { skip: true };
+  }
+
+  const num1 = parseInt(latest.number || '0') % 10;
+  const second = results[1];
+  const num2 = parseInt(second.number || '0') % 10;
+  
+  // Keep adding digits until single digit
+  let sum = num1 + num2;
+  while (sum >= 10) {
+    sum = String(sum).split('').reduce((a, b) => a + parseInt(b), 0);
+  }
+
+  const rawResult = sum >= 5 ? 'B' : 'S';
+  const betResult = rawResult === 'B' ? 'S' : 'B';
+
+  logging.info(`KENNO MAX: [${num2}+${num1}=>${sum}] => Bet ${betResult === 'B' ? 'BIG' : 'SMALL'}`);
+
+  return {
+    result: betResult,
+    sum: sum,
+    num1: num1,
+    num2: num2,
+    issueNumber: latest.issueNumber,
+    totalResults: results.length,
+    skip: false
+  };
+}
 
 async function makeRequest(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -283,7 +358,7 @@ function computeBetDetails(desiredAmount) {
 function calculateBetAmount(settings, currentBalance) {
   const bettingStrategy = settings.betting_strategy || "Martingale";
   const betSizes = settings.bet_sizes || [100];
-  const minBetSize = Math.min(...betSizes.filter(b => typeof b === 'number')); 
+  const minBetSize = Math.min(...betSizes.filter(b => typeof b === 'number'));
   if (bettingStrategy === "D'Alembert") {
     if (betSizes.length > 1) throw new Error("D'Alembert requires only ONE bet size");
     const unitSize = betSizes[0];
@@ -310,15 +385,10 @@ function updateBettingStrategy(settings, isWin, betAmount, rawBetItem) {
   } else if (bettingStrategy === "D'Alembert") {
     settings.dalembert_units = isWin ? Math.max(1, (settings.dalembert_units || 1) - 1) : (settings.dalembert_units || 1) + 1;
   } else if (bettingStrategy === "Custom") {
-    const currentIndex = settings.custom_index || 0;
     let actualIndex = 0;
     for (let i = 0; i < betSizes.length; i++) {
-      if (betSizes[i] === comparisonValue) {
-        actualIndex = i;
-        break;
-      }
+      if (betSizes[i] === comparisonValue) { actualIndex = i; break; }
     }
-    
     if (isWin) settings.custom_index = actualIndex > 0 ? actualIndex - 1 : 0;
     else settings.custom_index = actualIndex < betSizes.length - 1 ? actualIndex + 1 : betSizes.length - 1;
   }
@@ -402,21 +472,13 @@ async function placeBetRequest(session, issueNumber, selectType, unitAmount, bet
 async function sendMessageWithRetry(ctx, text, options = null) {
   for (let attempt = 0; attempt < MAX_TELEGRAM_RETRIES; attempt++) {
     try {
-      if (options) {
-        await ctx.reply(text, options);
-      } else {
-        await ctx.reply(text);
-      }
+      if (options) { await ctx.reply(text, options); }
+      else { await ctx.reply(text); }
       return true;
     } catch (error) {
       if (error.message.includes('can\'t parse entities') && options && options.parse_mode) {
-         try {
-             delete options.parse_mode;
-             await ctx.reply(text, options);
-             return true;
-         } catch (e) {}
+        try { delete options.parse_mode; await ctx.reply(text, options); return true; } catch (e) {}
       }
-      
       if (attempt < MAX_TELEGRAM_RETRIES - 1) await new Promise(r => setTimeout(r, TELEGRAM_RETRY_DELAY));
     }
   }
@@ -425,6 +487,8 @@ async function sendMessageWithRetry(ctx, text, options = null) {
 
 async function checkProfitAndStopLoss(userId, bot) {
   const settings = userSettings[userId] || {};
+  // KENNO MAX ignores profit/stop loss
+  if (settings.strategy === "KENNO_MAX") return false;
   const targetProfit = settings.target_profit;
   const stopLossLimit = settings.stop_loss;
   if (!targetProfit && !stopLossLimit) return false;
@@ -467,7 +531,7 @@ async function winLoseChecker(bot) {
 
         const data = gameType === "WINGO" ? (issueRes.data?.list || []) : (issueRes.data ? [issueRes.data.settled || {}] : []);
 
-        if (settings.strategy === "KENNO" && gameType === "TRX") {
+        if ((settings.strategy === "KENNO" || settings.strategy === "KENNO_V2" || settings.strategy === "KENNO_MAX") && gameType === "TRX") {
           for (const settled of data) {
             if (settled && settled.issueNumber && settled.number) {
               addKENNOResult(settled.issueNumber, settled.number);
@@ -488,6 +552,18 @@ async function winLoseChecker(bot) {
               if (!userAILast10Results[userId]) userAILast10Results[userId] = [];
               userAILast10Results[userId].push(bigSmall);
               if (userAILast10Results[userId].length > HISTORY_BUFFER_SIZE) userAILast10Results[userId] = userAILast10Results[userId].slice(-HISTORY_BUFFER_SIZE);
+
+              // KENNO MAX hit/loss tracking
+              if (settings.strategy === "KENNO_MAX") {
+                if (isWin) {
+                  if (!userKennoMaxHits[userId]) userKennoMaxHits[userId] = 0;
+                  userKennoMaxHits[userId]++;
+                  userKennoMaxConsecLosses[userId] = 0;
+                } else {
+                  if (!userKennoMaxConsecLosses[userId]) userKennoMaxConsecLosses[userId] = 0;
+                  userKennoMaxConsecLosses[userId]++;
+                }
+              }
 
               const entryLayer = settings.layer_limit || 1;
               if (entryLayer > 1) {
@@ -534,11 +610,22 @@ async function winLoseChecker(bot) {
               }
 
               const totalProfit = isVirtual ? (userStats[userId].virtual_balance - VIRTUAL_BALANCE) : (userStats[userId]?.profit || 0);
+              const currentHits = userKennoMaxHits[userId] || 0;
+              const consecLosses = userKennoMaxConsecLosses[userId] || 0;
               let message;
               if (isWin) {
-                message = `🟢 VICTORY\n\n💰 Profit: +${(amount * 0.96).toFixed(2)} MMK\n🎟️ Period: ${period}\n🎲 Result: ${number} (${bigSmall === 'B' ? 'BIG' : 'SMALL'})\n\n💳 Balance: ${currentBalance?.toFixed(2) || '0.00'} MMK\n📊 Net Profit: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)} MMK`;
+                message = `🟢 VICTORY\n\n💰 Profit: +${(amount * 0.96).toFixed(2)} MMK\n🎟️ Period: ${period}\n🎲 Result: ${number} (${bigSmall === 'B' ? 'BIG' : 'SMALL'})`;
+                if (settings.strategy === "KENNO_MAX") {
+                  const maxHits = settings.kenno_max_hits || 0;
+                  message += `\n🎯 Sniper Hits: ${currentHits}/${maxHits === 0 ? '∞' : maxHits}`;
+                }
+                message += `\n\n💳 Balance: ${currentBalance?.toFixed(2) || '0.00'} MMK\n📊 Net Profit: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)} MMK`;
               } else {
-                message = `🔴 DEFEAT\n\n💸 Loss: -${amount} MMK\n🎟️ Period: ${period}\n🎲 Result: ${number} (${bigSmall === 'B' ? 'BIG' : 'SMALL'})\n\n💳 Balance: ${currentBalance?.toFixed(2) || '0.00'} MMK\n📊 Net Profit: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)} MMK`;
+                message = `🔴 DEFEAT\n\n💸 Loss: -${amount} MMK\n🎟️ Period: ${period}\n🎲 Result: ${number} (${bigSmall === 'B' ? 'BIG' : 'SMALL'})`;
+                if (settings.strategy === "KENNO_MAX") {
+                  message += `\n⚠️ Consecutive Losses: ${consecLosses}/4`;
+                }
+                message += `\n\n💳 Balance: ${currentBalance?.toFixed(2) || '0.00'} MMK\n📊 Net Profit: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)} MMK`;
               }
               try { await bot.telegram.sendMessage(userId, message); } catch(e){}
 
@@ -578,7 +665,9 @@ async function winLoseChecker(bot) {
                 else { settings.entry_layer_state.consecutive_loses++; }
               }
 
-              const resultMessage = isWin ? `🟢 RESULT: WIN\nPeriod: ${period}\nOutcome: ${bigSmall === 'B' ? 'BIG' : 'SMALL'} (${number})` : `🔴 RESULT: LOSS\nPeriod: ${period}\nOutcome: ${bigSmall === 'B' ? 'BIG' : 'SMALL'} (${number})`;
+              const resultMessage = isWin
+                ? `🟢 RESULT: WIN\nPeriod: ${period}\nOutcome: ${bigSmall === 'B' ? 'BIG' : 'SMALL'} (${number})`
+                : `🔴 RESULT: LOSS\nPeriod: ${period}\nOutcome: ${bigSmall === 'B' ? 'BIG' : 'SMALL'} (${number})`;
               try { await bot.telegram.sendMessage(userId, resultMessage); } catch(e){}
 
               delete userSkippedBets[userId][period];
@@ -618,6 +707,12 @@ async function bettingWorker(userId, ctx, bot) {
   userShouldSkipNext[userId] = false;
   delete userSLSkipWaitingForWin[userId];
 
+  // Reset KENNO MAX counters on start
+  if (settings.strategy === "KENNO_MAX") {
+    userKennoMaxHits[userId] = 0;
+    userKennoMaxConsecLosses[userId] = 0;
+  }
+
   const entryLayer = settings.layer_limit || 1;
   if (entryLayer > 1) settings.entry_layer_state = { waiting_for_loses: true, consecutive_loses: 0 };
   if (settings.strategy === "AI_PREDICTION") { userAILast10Results[userId] = []; userAIRoundCount[userId] = 0; }
@@ -636,7 +731,10 @@ async function bettingWorker(userId, ctx, bot) {
     if (!balanceRetrieved) { await sendMessageWithRetry(ctx, "❌ Failed to verify balance. Please try again.", makeMainKeyboard(true)); settings.running = false; return; }
   }
 
-  await sendMessageWithRetry(ctx, `🚀 BOT ACTIVATED\n\n💰 Starting Balance: ${currentBalance} MMK\n🤖 Strategy: ${settings.strategy}\n\nWaiting for next round...`);
+  const maxHitsDisplay = settings.strategy === "KENNO_MAX"
+    ? `\n🎯 Target Hits: ${(settings.kenno_max_hits || 0) === 0 ? '∞ Unlimited' : settings.kenno_max_hits}`
+    : '';
+  await sendMessageWithRetry(ctx, `🚀 BOT ACTIVATED\n\n💰 Starting Balance: ${currentBalance} MMK\n🤖 Strategy: ${settings.strategy}${maxHitsDisplay}\n\nWaiting for next round...`);
 
   try {
     while (settings.running) {
@@ -699,6 +797,54 @@ async function bettingWorker(userId, ctx, bot) {
         }
         ch = prediction.result;
         kennoInfo = prediction;
+      } else if (settings.strategy === "KENNO_V2") {
+        const prediction = getKENNOV2Prediction();
+        if (!prediction) {
+          const currentKENNO = loadKENNOResults();
+          const waitMsg = `⏳ WAITING FOR DATA\n\nPeriod: ${currentIssue}\nStrategy: KENNO V2\nStatus: Collecting results (${currentKENNO.length}/3)`;
+          await sendMessageWithRetry(ctx, waitMsg);
+          settings.last_issue = currentIssue;
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        ch = prediction.result;
+        kennoInfo = prediction;
+      } else if (settings.strategy === "KENNO_MAX") {
+        if (!userKennoMaxConsecLosses[userId]) userKennoMaxConsecLosses[userId] = 0;
+        if (userKennoMaxConsecLosses[userId] >= 4) {
+          await sendMessageWithRetry(ctx, `🛑 KENNO MAX STOPPED\n\n⚠️ 4 Consecutive losses reached!\n\n💳 Balance: ${currentBalance.toFixed(2)} MMK`, makeMainKeyboard(true));
+          settings.running = false;
+          userStopInitiated[userId] = true;
+          break;
+        }
+
+        if (!userKennoMaxHits[userId]) userKennoMaxHits[userId] = 0;
+        const maxHits = settings.kenno_max_hits || 0;
+        if (maxHits > 0 && userKennoMaxHits[userId] >= maxHits) {
+          await sendMessageWithRetry(ctx, `🎯 KENNO MAX COMPLETE!\n\n✅ Reached ${maxHits} hit(s)!\n\n💳 Balance: ${currentBalance.toFixed(2)} MMK`, makeMainKeyboard(true));
+          settings.running = false;
+          userStopInitiated[userId] = true;
+          break;
+        }
+
+        const prediction = getKENNOMaxPrediction();
+        if (!prediction) {
+          const currentKENNO = loadKENNOResults();
+          const waitMsg = `⏳ WAITING FOR DATA\n\nPeriod: ${currentIssue}\nStrategy: KENNO MAX\nStatus: Collecting (${currentKENNO.length}/${KENNO_MAX_REQUIRED})`;
+          await sendMessageWithRetry(ctx, waitMsg);
+          settings.last_issue = currentIssue;
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+
+        if (prediction.skip) {
+          settings.last_issue = currentIssue;
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+
+        ch = prediction.result;
+        kennoInfo = prediction;
       } else if (settings.strategy === "AI_PREDICTION") {
         const prediction = await getAIPrediction(userId);
         ch = prediction ? prediction.result : (Math.random() < 0.5 ? 'B' : 'S');
@@ -742,26 +888,26 @@ async function bettingWorker(userId, ctx, bot) {
         let desiredAmount = 0;
         let rawBetItem = null;
         if (settings.betting_strategy === "D'Alembert") {
-           rawBetItem = betSizes[0]; 
-           desiredAmount = calculateBetAmount(settings, currentBalance);
+          rawBetItem = betSizes[0];
+          desiredAmount = calculateBetAmount(settings, currentBalance);
         } else if (settings.betting_strategy === "Martingale" || settings.betting_strategy === "Anti-Martingale") {
-           const idx = Math.min(settings.martin_index || 0, betSizes.length - 1);
-           rawBetItem = betSizes[idx];
+          const idx = Math.min(settings.martin_index || 0, betSizes.length - 1);
+          rawBetItem = betSizes[idx];
         } else {
-           const idx = Math.min(settings.custom_index || 0, betSizes.length - 1);
-           rawBetItem = betSizes[idx];
+          const idx = Math.min(settings.custom_index || 0, betSizes.length - 1);
+          rawBetItem = betSizes[idx];
         }
         if (rawBetItem === "ALL_IN") {
           desiredAmount = Math.floor(currentBalance / 100) * 100;
           if (desiredAmount < 100) {
-             await sendMessageWithRetry(ctx, "❌ Insufficient Balance for ALL IN.", makeMainKeyboard(true));
-             settings.running = false; break;
+            await sendMessageWithRetry(ctx, "❌ Insufficient Balance for ALL IN.", makeMainKeyboard(true));
+            settings.running = false; break;
           }
         } else if (typeof rawBetItem === 'number') {
           if (settings.betting_strategy === "Martingale" || settings.betting_strategy === "Anti-Martingale" || settings.betting_strategy === "Custom") {
-             desiredAmount = rawBetItem;
+            desiredAmount = rawBetItem;
           } else {
-             desiredAmount = calculateBetAmount(settings, currentBalance);
+            desiredAmount = calculateBetAmount(settings, currentBalance);
           }
         } else {
           desiredAmount = calculateBetAmount(settings, currentBalance);
@@ -774,6 +920,10 @@ async function bettingWorker(userId, ctx, bot) {
         }
 
         let betMsg = `🎲 BET PLACED\n\nPeriod: ${currentIssue}\nSelection: ${ch === 'B' ? 'BIG' : 'SMALL'}\nAmount: ${actualAmount} MMK`;
+        if (settings.strategy === "KENNO_MAX" && kennoInfo) {
+          const maxHits = settings.kenno_max_hits || 0;
+          betMsg += `\n\n🎯 Sniper Info:\nBet => ${ch === 'B' ? 'BIG' : 'SMALL'}\nHits: ${userKennoMaxHits[userId] || 0}/${maxHits === 0 ? '∞' : maxHits}\nConsec Losses: ${userKennoMaxConsecLosses[userId] || 0}/4`;
+        }
         await sendMessageWithRetry(ctx, betMsg);
 
         if (settings.virtual_mode) {
@@ -802,6 +952,7 @@ async function bettingWorker(userId, ctx, bot) {
     delete userWaitingForResult[userId]; delete userShouldSkipNext[userId]; delete userBalanceWarnings[userId];
     delete userSkipResultWait[userId]; delete userSLSkipWaitingForWin[userId];
     if (settings.strategy === "AI_PREDICTION") { delete userAILast10Results[userId]; delete userAIRoundCount[userId]; }
+    if (settings.strategy === "KENNO_MAX") { delete userKennoMaxHits[userId]; delete userKennoMaxConsecLosses[userId]; }
 
     let totalProfit = 0, balanceText = "";
     if (settings.virtual_mode) {
@@ -834,7 +985,8 @@ function makeStrategyKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("📜 BS Order", "strategy:BS_ORDER"), Markup.button.callback("🤖 AI Prediction", "strategy:AI_PREDICTION")],
     [Markup.button.callback("📈 Trend Follow", "strategy:TREND_FOLLOW"), Markup.button.callback("🔄 Alternate", "strategy:ALTERNATE")],
-    [Markup.button.callback("🎲 KENNO", "strategy:KENNO")]
+    [Markup.button.callback("🎲 KENNO", "strategy:KENNO"), Markup.button.callback("🎯 KENNO V2", "strategy:KENNO_V2")],
+    [Markup.button.callback("🎯 KENNO MAX (Sniper)", "strategy:KENNO_MAX")]
   ]);
 }
 
@@ -848,13 +1000,13 @@ function makeBettingStrategyKeyboard() {
 
 function makeEntryLayerKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("1 Layer", "entry_layer:1")], 
+    [Markup.button.callback("1 Layer", "entry_layer:1")],
     [Markup.button.callback("2 Layers", "entry_layer:2")],
-    [Markup.button.callback("3 Layers", "entry_layer:3")], 
+    [Markup.button.callback("3 Layers", "entry_layer:3")],
     [Markup.button.callback("4 Layers", "entry_layer:4")],
-    [Markup.button.callback("5 Layers", "entry_layer:5")], 
+    [Markup.button.callback("5 Layers", "entry_layer:5")],
     [Markup.button.callback("6 Layers", "entry_layer:6")],
-    [Markup.button.callback("7 Layers", "entry_layer:7")], 
+    [Markup.button.callback("7 Layers", "entry_layer:7")],
     [Markup.button.callback("8 Layers", "entry_layer:8")],
     [Markup.button.callback("9 Layers", "entry_layer:9")]
   ]);
@@ -866,6 +1018,14 @@ function makeSLLayerKeyboard() {
     [Markup.button.callback("1 Loss", "sl_layer:1"), Markup.button.callback("2 Losses", "sl_layer:2"), Markup.button.callback("3 Losses", "sl_layer:3")],
     [Markup.button.callback("4 Losses", "sl_layer:4"), Markup.button.callback("5 Losses", "sl_layer:5"), Markup.button.callback("6 Losses", "sl_layer:6")],
     [Markup.button.callback("7 Losses", "sl_layer:7"), Markup.button.callback("8 Losses", "sl_layer:8"), Markup.button.callback("9 Losses", "sl_layer:9")]
+  ]);
+}
+
+function makeKennoMaxHitsKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("1 Hit", "kenno_max_hits:1"), Markup.button.callback("2 Hits", "kenno_max_hits:2"), Markup.button.callback("3 Hits", "kenno_max_hits:3")],
+    [Markup.button.callback("4 Hits", "kenno_max_hits:4"), Markup.button.callback("5 Hits", "kenno_max_hits:5"), Markup.button.callback("10 Hits", "kenno_max_hits:10")],
+    [Markup.button.callback("20 Hits", "kenno_max_hits:20"), Markup.button.callback("50 Hits", "kenno_max_hits:50"), Markup.button.callback("♾️ Unlimited", "kenno_max_hits:0")]
   ]);
 }
 
@@ -889,10 +1049,11 @@ async function checkUserAuthorized(ctx) {
   if (!userSessions[ctx.from.id]) { await sendMessageWithRetry(ctx, "⚠️ Access Denied. Please login first.", makeMainKeyboard(false)); return false; }
   if (!userSettings[ctx.from.id]) {
     userSettings[ctx.from.id] = {
-      strategy: "AI_PREDICTION", betting_strategy: "Martingale", game_type: "TRX", martin_index: 0,
+      strategy: "KENNO_V2", betting_strategy: "Martingale", game_type: "TRX", martin_index: 0,
       dalembert_units: 1, pattern_index: 0, running: false, consecutive_losses: 0, current_layer: 0,
       skip_betting: false, sl_layer: null, original_martin_index: 0, original_dalembert_units: 1,
-      original_custom_index: 0, custom_index: 0, layer_limit: 1, virtual_mode: false
+      original_custom_index: 0, custom_index: 0, layer_limit: 1, virtual_mode: false,
+      bet_sizes: [1000, 3000, 7000, 16000, 36000, 76000, 160000, 360000]
     };
   }
   return true;
@@ -901,10 +1062,11 @@ async function checkUserAuthorized(ctx) {
 async function cmdStartHandler(ctx) {
   if (!userSettings[ctx.from.id]) {
     userSettings[ctx.from.id] = {
-      strategy: "AI_PREDICTION", betting_strategy: "Martingale", game_type: "TRX", martin_index: 0,
+      strategy: "KENNO_V2", betting_strategy: "Martingale", game_type: "TRX", martin_index: 0,
       dalembert_units: 1, pattern_index: 0, running: false, consecutive_losses: 0, current_layer: 0,
       skip_betting: false, sl_layer: null, original_martin_index: 0, original_dalembert_units: 1,
-      original_custom_index: 0, custom_index: 0, layer_limit: 1, virtual_mode: false
+      original_custom_index: 0, custom_index: 0, layer_limit: 1, virtual_mode: false,
+      bet_sizes: [1000, 3000, 7000, 16000, 36000, 76000, 160000, 360000]
     };
   }
   await sendMessageWithRetry(ctx, "👋 Welcome to CK Auto-Bot\n\nPlease login to continue.");
@@ -946,13 +1108,39 @@ async function callbackQueryHandler(ctx) {
   if (data.startsWith("strategy:")) {
     const strategy = data.split(":")[1];
     userSettings[userId].strategy = strategy;
-    if (strategy === "BS_ORDER") { userState[userId] = { state: "INPUT_BS_PATTERN" }; await sendMessageWithRetry(ctx, "📝 Please enter your BS pattern (e.g. BSBSSBBS):"); }
-    else if (strategy === "KENNO") {
-      const kr = loadKENNOResults();
+    if (strategy === "BS_ORDER") {
+      userState[userId] = { state: "INPUT_BS_PATTERN" };
+      await sendMessageWithRetry(ctx, "📝 Please enter your BS pattern (e.g. BSBSSBBS):");
+    } else if (strategy === "KENNO") {
       await sendMessageWithRetry(ctx, `✅ Strategy set to KENNO`);
+    } else if (strategy === "KENNO_V2") {
+      const kr = loadKENNOResults();
+      if (kr && kr.length >= 3) {
+        const num1 = parseInt(kr[0].number) % 10;
+        const num2 = parseInt(kr[1].number) % 10;
+        const num3 = parseInt(kr[2].number) % 10;
+        const weightedSum = (num1 * 0.5) + (num2 * 0.3) + (num3 * 0.2);
+        betOrder = `KENNO V2: ${weightedSum.toFixed(2)} => ${weightedSum >= 5 ? 'BIG' : 'SMALL'}`;
+      } else {
+        betOrder = `KENNO V2: Collecting (${loadKENNOResults().length}/3)...`;
+      }
+    } else if (strategy === "KENNO_MAX") {
+      userSettings[userId].kenno_max_hits = 0;
+      userKennoMaxHits[userId] = 0;
+      userKennoMaxConsecLosses[userId] = 0;
+      await sendMessageWithRetry(ctx, `🎯 KENNO MAX (Sniper) Selected!\n\n📐 Formula: Last 2 results added\n0-4 = Small (bet BIG)\n5-9 = Big (bet SMALL)\n\n⚠️ Auto-stops after 4 consecutive losses\n\nHow many times should the Sniper hit?`, makeKennoMaxHitsKeyboard());
+    } else {
+      await sendMessageWithRetry(ctx, `✅ Strategy: ${strategy}`);
     }
-    else { await sendMessageWithRetry(ctx, `✅ Strategy: ${strategy}`); }
     await ctx.deleteMessage();
+  } else if (data.startsWith("kenno_max_hits:")) {
+    const hits = parseInt(data.split(":")[1]);
+    userSettings[userId].kenno_max_hits = hits;
+    userKennoMaxHits[userId] = 0;
+    userKennoMaxConsecLosses[userId] = 0;
+    const hitsText = hits === 0 ? "♾️ Unlimited" : `${hits} hit(s)`;
+    await sendMessageWithRetry(ctx, `✅ KENNO MAX (Sniper) Ready!\n\n🎯 Target Hits: ${hitsText}\n⚠️ Stops after 4 consecutive losses\n\nPress ▶️ Start Bot when ready!`, makeMainKeyboard(true));
+    try { await ctx.deleteMessage(); } catch(e){}
   } else if (data.startsWith("betting_strategy:")) {
     const s = data.split(":")[1];
     userSettings[userId].betting_strategy = s;
@@ -979,7 +1167,7 @@ async function callbackQueryHandler(ctx) {
   } else if (data.startsWith("bet_size:")) {
     const val = data.split(":")[1];
     const s = userSettings[userId];
-    
+
     if (val === "CUSTOM") {
       userState[userId] = { state: "INPUT_BET_SIZES" };
       await sendMessageWithRetry(ctx, "💰 Set Bet Sizes\n\nEnter amounts like this.\n\n100\n500\nALL IN\n\nYou can use numbers and 'ALL IN':");
@@ -1022,22 +1210,15 @@ async function textMessageHandler(ctx) {
   const text = normalizeText(rawText);
   const lines = text.split('\n').map(l => l.trim()).filter(l => l);
 
-  if (rawText.includes("🔑 Login Account") || rawText.includes("🔑 Re-Login")) { 
+  if (rawText.includes("🔑 Login Account") || rawText.includes("🔑 Re-Login")) {
     await sendMessageWithRetry(ctx, "🔐 Account Login\n\nPlease enter your login info:\n\nLine 1: Login\nLine 2: Phone Number\nLine 3: Password");
-    return; 
+    return;
   }
   if (rawText.includes("My Stats")) {
-    console.log(`[DEBUG] My Stats clicked. Text: "${rawText}"`);
     try {
-        if (!userSessions[userId]) {
-            await sendMessageWithRetry(ctx, "⚠️ Please login first.", makeMainKeyboard(false));
-            return;
-        }
-        await showUserStats(ctx, userId);
-    } catch (error) {
-        console.error("[ERROR] My Stats failed:", error);
-        await sendMessageWithRetry(ctx, `❌ Error loading stats: ${error.message}`);
-    }
+      if (!userSessions[userId]) { await sendMessageWithRetry(ctx, "⚠️ Please login first.", makeMainKeyboard(false)); return; }
+      await showUserStats(ctx, userId);
+    } catch (error) { await sendMessageWithRetry(ctx, `❌ Error loading stats: ${error.message}`); }
     return;
   }
 
@@ -1046,6 +1227,7 @@ async function textMessageHandler(ctx) {
     if (!s.bet_sizes) { await sendMessageWithRetry(ctx, "⚠️ Please set your Bet Size first!", makeMainKeyboard(true)); return; }
     if (s.strategy === "BS_ORDER" && !s.pattern) { s.pattern = DEFAULT_BS_ORDER; s.pattern_index = 0; }
     if (s.betting_strategy === "D'Alembert" && s.bet_sizes.length > 1) { await sendMessageWithRetry(ctx, "❌ D'Alembert strategy requires only ONE bet size.", makeMainKeyboard(true)); return; }
+    if (s.strategy === "KENNO_MAX" && s.kenno_max_hits === undefined) { await sendMessageWithRetry(ctx, "⚠️ Please select KENNO MAX from strategy menu first to set hit count!", makeMainKeyboard(true)); return; }
     if (s.running) { await sendMessageWithRetry(ctx, "⚠️ The bot is already running!", makeMainKeyboard(true)); return; }
     s.running = true; s.consecutive_errors = 0;
     const el = s.layer_limit || 1;
@@ -1060,6 +1242,7 @@ async function textMessageHandler(ctx) {
     if (!s.running) { await sendMessageWithRetry(ctx, "⚠️ The bot is not currently running.", makeMainKeyboard(true)); return; }
     userStopInitiated[userId] = true; s.running = false; delete userWaitingForResult[userId]; delete userShouldSkipNext[userId]; delete userSLSkipWaitingForWin[userId];
     if (s.strategy === "AI_PREDICTION") { delete userAILast10Results[userId]; delete userAIRoundCount[userId]; }
+    if (s.strategy === "KENNO_MAX") { delete userKennoMaxHits[userId]; delete userKennoMaxConsecLosses[userId]; }
     let tp = 0, bt = "";
     if (s.virtual_mode) { tp = (userStats[userId]?.virtual_balance || VIRTUAL_BALANCE) - VIRTUAL_BALANCE; bt = `Virtual Balance: ${(userStats[userId]?.virtual_balance || VIRTUAL_BALANCE).toFixed(2)} MMK\n`; }
     else { tp = userStats[userId]?.profit || 0; try { const fb = await getBalance(userSessions[userId], userId); bt = `Real Balance: ${fb?.toFixed(2) || '0.00'} MMK\n`; } catch(e) {} }
@@ -1068,10 +1251,7 @@ async function textMessageHandler(ctx) {
     await sendMessageWithRetry(ctx, `🛑 BOT STOPPED MANUALLY\n\n${bt}💰 Session Profit: ${pi}${tp.toFixed(2)} MMK`, makeMainKeyboard(true));
     return;
   }
-  if (rawText.includes("💰 Bet Size")) { 
-    await sendMessageWithRetry(ctx, "💰 Select Bet Size:", makeBetSizeKeyboard()); 
-    return; 
-  }
+  if (rawText.includes("💰 Bet Size")) { await sendMessageWithRetry(ctx, "💰 Select Bet Size:", makeBetSizeKeyboard()); return; }
   if (rawText.includes("💎 Mode (V/R)")) { await sendMessageWithRetry(ctx, "🎛️ Select Mode", makeModeSelectionKeyboard()); return; }
   if (rawText.includes("📈 Profit Target")) { userState[userId] = { state: "INPUT_PROFIT_TARGET" }; await sendMessageWithRetry(ctx, "📈 Set Profit Target\n\nEnter amount (e.g. 100000):"); return; }
   if (rawText.includes("📉 Stop Loss")) { userState[userId] = { state: "INPUT_STOP_LIMIT" }; await sendMessageWithRetry(ctx, "📉 Set Stop Loss Limit\n\nEnter amount (e.g. 50000):"); return; }
@@ -1083,7 +1263,7 @@ async function textMessageHandler(ctx) {
   const command = text.toUpperCase().replace(/[_ /\(\)▶️⏹️💰💎📈📉🎯🤖🔄💥📊🔑]/g, '');
   if (command === "LOGIN" || (lines.length > 0 && lines[0].toLowerCase() === "login")) {
     if (lines.length >= 3 && lines[0].toLowerCase() === "login") {
-      await sendMessageWithRetry(ctx, "🔄 Verify!Please Wait...");
+      await sendMessageWithRetry(ctx, "🔄 Verify! Please Wait...");
       const { response: res, session } = await loginRequest(lines[1], lines[2]);
       if (session) {
         const userInfo = await getUserInfo(session, userId);
@@ -1094,7 +1274,13 @@ async function textMessageHandler(ctx) {
           }
           userSessions[userId] = session; userGameInfo[userId] = userInfo;
           const balance = await getBalance(session, userId);
-          if (!userSettings[userId]) userSettings[userId] = { strategy: "AI_PREDICTION", betting_strategy: "Martingale", game_type: "TRX", martin_index: 0, dalembert_units: 1, pattern_index: 0, running: false, consecutive_losses: 0, current_layer: 0, skip_betting: false, sl_layer: null, original_martin_index: 0, original_dalembert_units: 1, original_custom_index: 0, custom_index: 0, layer_limit: 1, virtual_mode: false };
+          if (!userSettings[userId]) userSettings[userId] = {
+            strategy: "KENNO_V2", betting_strategy: "Martingale", game_type: "TRX", martin_index: 0,
+            dalembert_units: 1, pattern_index: 0, running: false, consecutive_losses: 0, current_layer: 0,
+            skip_betting: false, sl_layer: null, original_martin_index: 0, original_dalembert_units: 1,
+            original_custom_index: 0, custom_index: 0, layer_limit: 1, virtual_mode: false,
+            bet_sizes: [1000, 3000, 7000, 16000, 36000, 76000, 160000, 360000]
+          };
           if (!userStats[userId]) userStats[userId] = { start_balance: parseFloat(balance || 0), profit: 0.0 };
           await sendMessageWithRetry(ctx, `✅ Login Successful\n\n👤 ID: ${userInfo.user_id}\n💰 Balance: ${balance || 0} MMK`, makeMainKeyboard(true));
         } else { await sendMessageWithRetry(ctx, "❌ Login failed. Invalid credentials.", makeMainKeyboard(false)); }
@@ -1112,13 +1298,9 @@ async function textMessageHandler(ctx) {
     if (cs === "INPUT_BET_SIZES") {
       const parsedSizes = [];
       for (const line of lines) {
-        if (line.toUpperCase() === "ALL IN" || line.toUpperCase() === "ALL_IN") {
-          parsedSizes.push("ALL_IN");
-        } else if (line.match(/^\d+$/)) {
-          parsedSizes.push(Number(line));
-        }
+        if (line.toUpperCase() === "ALL IN" || line.toUpperCase() === "ALL_IN") { parsedSizes.push("ALL_IN"); }
+        else if (line.match(/^\d+$/)) { parsedSizes.push(Number(line)); }
       }
-
       if (!parsedSizes.length) throw new Error("No valid numbers found");
       const s = userSettings[userId];
       if (s.betting_strategy === "D'Alembert" && parsedSizes.length > 1) { await sendMessageWithRetry(ctx, "❌ D'Alembert requires only ONE bet size.", makeMainKeyboard(true)); return; }
@@ -1147,7 +1329,7 @@ async function showUserStats(ctx, userId) {
   if (!userInfo) { await sendMessageWithRetry(ctx, "❌ Failed to retrieve user info.", makeMainKeyboard(true)); return; }
   const s = userSettings[userId] || {};
   const betSizes = s.bet_sizes || [];
-  const strategy = s.strategy || "AI_PREDICTION";
+  const strategy = s.strategy || "KENNO_V2";
   const bettingStrategy = s.betting_strategy || "Martingale";
   const virtualMode = s.virtual_mode || false;
 
@@ -1163,12 +1345,21 @@ async function showUserStats(ctx, userId) {
       if (kenno && kenno.number) {
         const num = parseInt(kenno.number) % 10;
         betOrder = `KENNO: [(${num >= 5 ? 'BIG' : 'SMALL'})`;
-      } else {
-        betOrder = `KENNO: Data Error`;
-      }
-    } else {
-      betOrder = `KENNO: ${kr.length}/${KENNO_REQUIRED} (Collecting...)`;
-    }
+      } else { betOrder = `KENNO: Data Error`; }
+    } else { betOrder = `KENNO: ${kr.length}/${KENNO_REQUIRED} (Collecting...)`; }
+  } else if (strategy === "KENNO_V2") {
+    const kr = loadKENNOResults();
+    if (kr && kr.length > 0) {
+      const latest = kr[0];
+      const num = parseInt(latest.number) % 10;
+      betOrder = `KENNO V2: Copy Latest = ${num >= 5 ? 'BIG' : 'SMALL'} (${num})`;
+    } else { betOrder = `KENNO V2: Waiting for first result...`; }
+  } else if (strategy === "KENNO_MAX") {
+    const kr = loadKENNOResults();
+    const maxHits = s.kenno_max_hits || 0;
+    const currentHits = userKennoMaxHits[userId] || 0;
+    const consecLosses = userKennoMaxConsecLosses[userId] || 0;
+    betOrder = `KENNO MAX\nHits: ${currentHits}/${maxHits === 0 ? '∞' : maxHits} | Losses: ${consecLosses}/4`;
   } else if (strategy === "AI_PREDICTION") {
     const rc = userAIRoundCount[userId] || 0;
     betOrder = rc <= 10 ? `AI: Learning (${rc}/10)` : "AI: Active Analysis";
